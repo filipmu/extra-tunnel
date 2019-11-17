@@ -2,6 +2,8 @@ const cp = require('child_process');
 const url = require('url');
 const net = require('net');
 const fs = require('fs');
+var crypto = require("crypto");
+
 
 
 // I. global variables
@@ -25,6 +27,26 @@ const tokenRes = () => (
   'Connection: Upgrade\r\n'+
   '\r\n'
 );
+//encryption key
+var key = new Buffer('85CE6CCF67FBBAA8BB13479C3A6E084D', 'hex');
+
+
+function encrypt(key, data) {
+    var cipher = crypto.createCipher('aes256', key);
+    var crypted = cipher.update(data, 'utf-8', 'hex');
+    crypted += cipher.final('hex');
+
+    return crypted;
+}
+
+function decrypt(key, data) {
+    var decipher = crypto.createDecipher('aes256', key);
+    var decrypted = decipher.update(data, 'hex', 'utf-8');
+    decrypted += decipher.final('utf-8');
+
+    return decrypted;
+}
+
 
 
 function buffersConcat(bufs) {
@@ -63,7 +85,7 @@ function httpParse(buf) {
     {method, url, httpVersion, headers, length, buffer};
 };
 
-function packetRead(bsz, bufs, buf, fn) {
+function packetRead(bsz, bufs, buf, key, fn) {
   // 1. update buffers
   bufs.push(buf);
   bsz += buf.length;
@@ -78,24 +100,26 @@ function packetRead(bsz, bufs, buf, fn) {
     const set = buf.readUInt32BE(4, true);
     const tag = buf.readUInt32BE(8, true);
     const body = buf.slice(12, psz);
+    var decryptedText = decrypt(key, body.toString('utf-8'));
     // 4. update buffers and call
     bufs[0] = buf.slice(psz);
     bsz = bufs[0].length;
-    fn(on, set, tag, body);
+    fn(on, set, tag, decryptedText);
   }
   return bsz;
 };
 
-function packetWrite(on, set, tag, body) {
+function packetWrite(on, set, tag, body, key) {
   // 1. allocate buffer
   body = body||BUFFER_EMPTY;
+  var encryptedText = encrypt(key, body);
   const buf = Buffer.allocUnsafe(12+body.length);
   // 2. write [size][on][set][tag][body]
   buf.writeUInt16BE(buf.length, 0, true);
   buf.write(on, 2, 2);
   buf.writeUInt32BE(set, 4, true);
   buf.writeUInt32BE(tag, 8, true);
-  body.copy(buf, 12);
+  encryptedText.copy(buf, 12);
   return buf;
 };
 
@@ -120,18 +144,18 @@ function Tunnel(px, o) {
   clients.set(0, '/');
   var idn = 1;
 
-  function channelWrite(id, on, set, tag, body) {
+  function channelWrite(id, on, set, tag, body, key) {
     // a. write to channel, if exists
     const soc = sockets.get(channels.get(id));
-    if(soc) return soc.write(packetWrite(on, set, tag, body));
+    if(soc) return soc.write(packetWrite(on, set, tag, body, key));
   };
 
-  function clientWrite(on, set, tag, body) {
+  function clientWrite(on, set, tag, body, key) {
     // a. write to other/root client
     const soc = sockets.get(set? set : tag);
     if(!soc) return;
-    if(set) return soc.write(packetWrite(on, 0, tag, body));
-    if(on==='d+') return soc.write(body);
+    if(set) return soc.write(packetWrite(on, 0, tag, body, key));
+    if(on==='d+') return soc.write(body);  //this is not encrypted
     if(sockets.delete(tag)) soc.destroy();
   };
 
@@ -159,9 +183,9 @@ function Tunnel(px, o) {
     });
     // e. data? write to client
     soc.on('data', (buf) => {
-      bsz = packetRead(bsz, bufs, buf, (on, set, tag, body) => {
-        if(on==='pi') return soc.write(packetWrite('po', 0, 0));
-        if(clients.get(set)===chn) clientWrite(on, set, tag, body);
+      bsz = packetRead(bsz, bufs, buf, key, (on, set, tag, body) => {
+        if(on==='pi') return soc.write(packetWrite('po', 0, 0, key));
+        if(clients.get(set)===chn) clientWrite(on, set, tag, body, key);
       });
     });
   };
@@ -183,9 +207,9 @@ function Tunnel(px, o) {
     });
     // e. data? write to channel
     soc.on('data', (buf) => {
-      bsz = packetRead(bsz, bufs, buf, (on, set, tag, body) => {
-        if(on==='pi') return soc.write(packetWrite('po', 0, 0));
-        channelWrite(chn, on, id, tag, body);
+      bsz = packetRead(bsz, bufs, buf, key, (on, set, tag, body) => {
+        if(on==='pi') return soc.write(packetWrite('po', 0, 0, key));
+        channelWrite(chn, on, id, tag, body, key);
       });
     });
   };
@@ -199,11 +223,11 @@ function Tunnel(px, o) {
     channelWrite('/', 'd+', 0, id, buf);
     // b. closed? delete and notify if exists
     soc.on('close', () => {
-      if(sockets.delete(id)) channelWrite('/', 'c-', 0, id);
+      if(sockets.delete(id)) channelWrite('/', 'c-', 0, id, key);
     });
     // c. data? write to channel
     soc.on('data', (buf) => {
-      channelWrite('/', 'd+', 0, id, buf);
+      channelWrite('/', 'd+', 0, id, buf, key);
     });
   };
 
@@ -376,7 +400,7 @@ function Client(px, o) {
   function tconPing() {
     // a. send a ping packet
     if(tcon.destroyed) return;
-    tcon.write(packetWrite('pi', 0, 0));
+    tcon.write(packetWrite('pi', 0, 0, key));
     setTimeout(tconPing, o.ping);
   };
 
@@ -407,7 +431,7 @@ function Client(px, o) {
   // 8. data? handle it
   tcon.on('data', (buf) => {
     // a. handle packets from tunnel
-    if(ath) return bsz = packetRead(bsz, bufs, buf, (on, set, tag, body) => {
+    if(ath) return bsz = packetRead(bsz, bufs, buf, key, (on, set, tag, body) => {
       const soc = sockets.get(tag);
       if(!soc) return;
       if(on==='d+') return soc.write(body);
@@ -444,7 +468,7 @@ function Client(px, o) {
     // a. report connection
     const id = idn++;
     sockets.set(id, soc);
-    tcon.write(packetWrite('c+', 0, id));
+    tcon.write(packetWrite('c+', 0, id, key));
     console.log(`${px}:${id} connected`);
     // b. error? report
     soc.on('error', (err) => {
@@ -454,11 +478,11 @@ function Client(px, o) {
     // c. closed? delete
     soc.on('close', () => {
       console.log(`${px}:${id} closed`);
-      if(sockets.delete(id)) tcon.write(packetWrite('c-', 0, id));
+      if(sockets.delete(id)) tcon.write(packetWrite('c-', 0, id, key));
     });
     // d. data? handle it
     soc.on('data', (buf) => {
-      tcon.write(packetWrite('d+', 0, id, buf));
+      tcon.write(packetWrite('d+', 0, id, buf, key));
     });
   });
 };
